@@ -1,0 +1,6 @@
+__pycache__
+*.db
+*.pyc
+*.csv
+.env
+qdrant_storage

@@ -1,0 +1,44 @@
+# .github/workflows/ci.yml
+name: FinAgent CI
+
+# Kích hoạt pipeline mỗi khi có hành động Push hoặc Pull Request vào nhánh main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  code-quality-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout mã nguồn từ Repo về môi trường ảo của GitHub
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Khởi tạo môi trường Python 3.10
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip" # cache các gói pip để tăng tốc pipeline ở những lần chạy sau
+
+      # 3. Cài đặt các dependencies cần thiết
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 4. Chạy Linter rà soát lỗi cú pháp
+      - name: Lint with flake8
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 src/ main.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings.
+          flake8 src/ main.py --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      # 5. Kích hoạt Unit Test tự động
+      - name: Run Unit Tests with pytest
+        run: |
+          pytest tests/

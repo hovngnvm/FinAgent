@@ -1,0 +1,8 @@
+langgraph
+langchain-community
+qdrant-client
+sentence-transformers
+pandas
+pytest
+flake8
+black
