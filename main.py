@@ -10,9 +10,7 @@ def main():
     init_relational_database()
     init_vector_database()
     
-    print("\nHệ thống sẵn sàng! Hãy nhập câu hỏi thử nghiệm.")
-    user_input = "Cho tôi biết giá đóng cửa gần đây nhất của mã BTC."
-    print(user_input)
+    user_input = input("\nUser: ")
     
     initial_state = {
         "messages": [HumanMessage(content=user_input)],

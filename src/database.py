@@ -14,7 +14,6 @@ def init_relational_database():
         # Ghi đè dữ liệu sạch vào bảng prices
         df.to_sql("prices", conn, if_exists="replace", index=False)
         conn.close()
-        print("-> Đã đồng bộ dữ liệu CSV vào SQLite thành công.")
     else:
         print("-> Lỗi: Không tìm thấy file raw.csv!")
 

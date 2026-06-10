@@ -3,18 +3,16 @@ import os
 import json
 import pytest
 
-def test_json_parsing_logic():
-    """Test độc lập logic bóc tách JSON State để đảm bảo hàm json.loads không bị crash vô lý"""
-    mock_llm_response = '{"target": "BTC"}'
-    
-    parsed_data = json.loads(mock_llm_response)
-    
-    assert "target" in parsed_data
-    assert parsed_data["target"] == "BTC"
+def test_intent_parsing():
+    """Test kịch bản bóc tách câu chào hỏi thông thường"""
+    mock_response = '{"target": "UNKNOWN", "intent": "CHITCHAT"}'
+    data = json.loads(mock_response)
+    assert data["intent"] == "CHITCHAT"
+    assert data["target"] == "UNKNOWN"
 
-def test_unknown_json_parsing_logic():
-    """Test kịch bản Edge Case khi user chat câu phá hoại và LLM nhả UNKNOWN"""
-    mock_llm_response = '{"target": "UNKNOWN"}'
-    parsed_data = json.loads(mock_llm_response)
-    
-    assert parsed_data["target"] == "UNKNOWN"
+def test_intent_parsing_2():
+    """Test kịch bản câu hỏi đòi số liệu cứng"""
+    mock_response = '{"target": "BTC", "intent": "MARKET_DATA"}'
+    data = json.loads(mock_response)
+    assert data["intent"] == "MARKET_DATA"
+    assert data["target"] == "BTC"
