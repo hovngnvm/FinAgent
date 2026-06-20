@@ -3,6 +3,8 @@ from langchain_core.messages import BaseMessage, AnyMessage, ToolMessage, HumanM
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaLLM, ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
+
 import json, re
 
 from src.tools import tool_run_sqlite_query, tool_semantic_rag_search, tool_generate_market_chart
@@ -31,7 +33,7 @@ def node_security_shield(state: AgentState):
                                      re.IGNORECASE)
     
     if SQL_INJECTION_REGEX.search(last_user_message):
-        return {"security_status": "MALICIOUS"}
+        return {"security_status": "MALICIOUS", "next_worker": "FINISH"}
     
     llm_json = ChatOllama(model="llama-guard3:1b-q5_K_S", temperature=0.0).with_structured_output({
         "type": "object",
@@ -45,7 +47,10 @@ def node_security_shield(state: AgentState):
     except Exception as e:
         status = "MALICIOUS"
         
-    return {"security_status": status}
+    if status == "MALICIOUS":
+        return {"security_status": "MALICIOUS", "next_worker": "FINISH"}
+    else:
+        return {"security_status": "SAFE", "next_worker": "CONTINUE"}
 
 def node_driver(state: AgentState):
     user_msg = state["messages"][0].content
@@ -83,8 +88,8 @@ def node_sql_worker(state: AgentState):
     retries = state.get("retry_count", 0)
     error = state.get("error_log", "")
     
-    schema_info = "Table: prices | Columns: timestamp (DATETIME), symbol (VARCHAR), price (REAL), volume (REAL)"
-    
+    schema_info = "Table: prices | Columns: timestamp (DATETIME), symbol (VARCHAR), price (REAL), volume (REAL), SMA_5(REAL), SMA_20(REAL), RSI(REAL), MACD(REAL), MACD_Signal(REAL)"
+
     system_prompt = (
         "Based on the following schema, please generate an accurate SQLite query:\n"
         f"Schema: {schema_info}\n"
@@ -143,11 +148,12 @@ def node_rag_worker(state: AgentState):
     except:
         need_rewrite = False
         
+        
     if need_rewrite:
         system_prompt = (
             "You are a Senior Context Engineering Expert. "
             "Your task is to read the user's financial query, analyze quickly the raw data from SQL "
-            "and rewrite it into a HYPOTHETICAL DOCUMENT (HyDE) or an expanded keyword sequence (Query Expansion) containing specialized financial terms. "
+            "and rewrite it into a HYPOTHETICAL DOCUMENT (HyDE) or an expanded keyword sequence (Query Expansion) containing specialized financial terms and removing the stop words and filler words. "
             "This enhanced text will be used to perform vector search, maximizing retrieval accuracy. "
             "Completely eliminate any redundant greetings or exclamations from the user. "
             "The output must be concise, professional, and focused on the economic essence."
@@ -163,15 +169,17 @@ def node_rag_worker(state: AgentState):
 def node_final_analyst(state: AgentState):
     llm_analyst = OllamaLLM(model="qwen3.5:4b-q4_K_M", temperature=0.3)
     
-    target = state["current_target"]
-    
+    conversation_history = state["messages"]
+    user_msg = conversation_history[-1].content
+        
     if state["chat"]:
         system_prompt = (
             "You are a friendly finacial assistant aka FinAgent. respond politely and naturally in Vietnamese!"
         )
-        prompt_payload = ""
+        prompt_payload = ("=== USER QUESTION ===\n" 
+                         f"{user_msg}"
+        )
     else:
-        user_question = state["messages"][0].content
         target = state["current_target"]
         sql_numbers = state.get("sql_data_output", [])
         rag_news = state.get("rag_text_output", "No related news found.")
@@ -183,8 +191,8 @@ def node_final_analyst(state: AgentState):
             f"{json.dumps(sql_numbers, indent=2) if sql_numbers else 'No time-series data available.'}\n\n"
             "=== NEWS CONTEXT ===\n"
             f"{rag_news}\n\n"
-            "=== USER QUESTION ===\n"
-            f"{user_question}"
+            "=== CHAT HISTORY ===\n"
+            f"{conversation_history}"
     )
 
         system_prompt = (
@@ -199,10 +207,14 @@ def node_final_analyst(state: AgentState):
 
 def node_purge_state(state: AgentState):
     return {
-        "current_target": "NONE",
-        "sql_data_output": [],
-        "rag_text_output": "",
-        "error_log": ""
+        "security_status": "",
+        "chat": False,
+        "sql_data_output": [],        
+        "rag_text_output": "",          
+        "chart_status_msg": "",        
+        "error_log": "",                
+        "retry_count": 0,
+        "next_worker": "FINISH"
     }
 
 def supervisor_conditional_edge(state: AgentState):
@@ -228,19 +240,19 @@ workflow.set_entry_point("security_shield")
 # Gateway Security Router
 workflow.add_conditional_edges(
     "security_shield",
-    lambda state: "blocked" if state["next_worker"] == "END" else "pass",
+    lambda state: "blocked" if state["next_worker"] == "FINISH" else "pass",
     {"blocked": "final_analyst", "pass": "driver"}
+)
+
+workflow.add_conditional_edges(
+    "driver",
+    lambda state: "blocked" if state["next_worker"] == "FINISH" else "pass",
+    {"blocked": "final_analyst", "pass": "supervisor"}
 )
 
 # Main Supervisor Router
 workflow.add_conditional_edges(
     "driver",
-    lambda state: "blocked" if state["next_worker"] == "END" else "pass",
-    {"blocked": "final_analyst", "pass": "supervisor"}
-)
-
-workflow.add_conditional_edges(
-    "supervisor",
     supervisor_conditional_edge,
     {
         "call_sql": "sql_worker",
@@ -265,4 +277,6 @@ workflow.add_edge("final_analyst", "state_purger")
 
 workflow.add_edge("state_purger", END)
 
-app = workflow.compile()
+memory = MemorySaver()
+
+app = workflow.compile(checkpointer=memory)

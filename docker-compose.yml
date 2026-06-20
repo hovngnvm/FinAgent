@@ -1,0 +1,63 @@
+services:
+  # HẠ TẦNG KAFKA KRAFT MODE TIÊN TIẾN
+  services:
+  kafka:
+    image: apache/kafka:3.7.0  # Đã đổi sang Apache chính thức
+    container_name: finagent_kafka
+    ports:
+      - "9092:9092" # Cổng cho máy local kết nối vào
+    environment:
+      # Cấu hình Cluster & KRaft Node
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:9093'
+      
+      # Định nghĩa các Listeners
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      
+      # Áp dụng chiến thuật của Cấu hình 1: Tách biệt nội bộ Docker và ngoài Host
+      # - Nội bộ Docker kết nối qua: kafka:29092
+      # - Máy ngoài (Host) kết nối qua: localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      
+      # --- ĐOẠN TỐI ƯU CỦA APACHE (Đã chuyển đổi đúng cú pháp) ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1 # Sửa chữ REREPLICATION thành REPLICATION cho đúng chuẩn Apache
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true' # Tự động tạo topic khi có dữ liệu đẩy vào
+      
+      # Định danh Cluster cho KRaft
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+
+  langfuse_db:
+    image: postgres:16-alpine
+    container_name: finagent_langfuse_db
+    restart: always
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: secret_password
+      POSTGRES_DB: langfuse
+    ports:
+      - "5433:5432"
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+
+  langfuse_server:
+    image: langfuse/langfuse:2
+    container_name: finagent_langfuse_server
+    restart: always
+    depends_on:
+      - langfuse_db
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://langfuse:secret_password@langfuse_db:5432/langfuse
+      - NEXTAUTH_SECRET=secret_salt_string_for_auth_encryption
+      - SALT=secret_salt_for_password_hashing
+      - TELEMETRY_ENABLED=false # Tắt telemetry gửi về hãng để bảo mật tuyệt đối
