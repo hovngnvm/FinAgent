@@ -3,10 +3,14 @@ from langchain_core.messages import BaseMessage, AnyMessage, ToolMessage, HumanM
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaLLM, ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.redis import RedisSaver
+from redis import Redis
+from dotenv import load_dotenv
+load_dotenv()
 
-import json, re
+import json, re, os
 
+# Đảm bảo các tool đã được cập nhật driver PostgreSQL từ Giai đoạn 1
 from src.tools import tool_run_sqlite_query, tool_semantic_rag_search, tool_generate_market_chart
 
 class AgentState(TypedDict):
@@ -24,13 +28,17 @@ class AgentState(TypedDict):
     
     next_worker: str
 
-llm = OllamaLLM(model="qwen2.5-coder:3b-instruct-q5_K_S", temperature=0, format="json") #json mode
+# Khởi tạo mô hình ngôn ngữ lớn (Đồng bộ cấu hình vLLM/Ollama local)
+llm = OllamaLLM(model="qwen2.5-coder:3b-instruct-q5_K_S", temperature=0, format="json")
 
 def node_security_shield(state: AgentState):
+    """Guardrails: Bảo vệ hệ thống khỏi Prompt Injection và độc hại"""
     last_user_message = state["messages"][-1].content
     
-    SQL_INJECTION_REGEX = re.compile(r"(\b(DROP|DELETE|ALTER|TRUNCATE|UPDATE)\b\s+\b(TABLE|FROM|DATABASE|KEY)\b)|(--)|(\/\*|\*\/)",
-                                     re.IGNORECASE)
+    SQL_INJECTION_REGEX = re.compile(
+        r"(\b(DROP|DELETE|ALTER|TRUNCATE|UPDATE)\b\s+\b(TABLE|FROM|DATABASE|KEY)\b)|(--)|(\/\*|\*\/)",
+        re.IGNORECASE
+    )
     
     if SQL_INJECTION_REGEX.search(last_user_message):
         return {"security_status": "MALICIOUS", "next_worker": "FINISH"}
@@ -39,7 +47,7 @@ def node_security_shield(state: AgentState):
         "type": "object",
         "properties": {"status": {"type": "string", "enum": ["SAFE", "MALICIOUS"]}},
         "required": ["status"]
-    }) ####################
+    })
     
     try:
         response = llm_json.invoke([{"role": "user", "content": last_user_message}])
@@ -53,49 +61,46 @@ def node_security_shield(state: AgentState):
         return {"security_status": "SAFE", "next_worker": "CONTINUE"}
 
 def node_driver(state: AgentState):
+    """Supervisor Agent: Phân tích Intent ban đầu và điều phối Multi-Agent"""
     user_msg = state["messages"][0].content
-    sql_done = "YES" if state.get("sql_data_output") else "NO"
-    rag_done = "YES" if state.get("rag_text_output") else "NO"
-    chart_done = "YES" if state.get("chart_status_msg") else "NO"
     
     system_instruction = (
-        "You are the Orchestration Manager of the FinAgent system. Read the user's query and the current progress status to decide which agent to call next.\n"
-        "- 'SQL_Agent': Call when the user requests to view data, prices, or generate charts, and the system has not yet retrieved the data.\n"
-        "- 'RAG_Agent': Call when the user asks about macroeconomics, trends, or after the SQL agent has completed data retrieval to find supporting information.\n"
-        "- 'Chart_Agent': Call when the user requests to view charts/graphs AND the SQL agent has completed data retrieval.\n"
-        "- 'FINISH': Call when sufficient data has been collected\n"
-        "You have two modes: \"INVESTMENT\" and \"CHITCHAT\".\n"
-        "- If the user asks about investment strategies, asset analysis, stock prices, financial data, or related topics, set \"chat\" to \"false\".\n"
-        "- If the user asks about general topics, greetings, casual conversation, or non-investment questions, set \"chat\" to \"true\".\n"
-        "MANDATORY JSON OUTPUT: {\"target\": \"SYMBOL\", \"assign_to\": \"AGENT_NAME\", \"chat\": true/false}"
+        "You are the Strategic Supervisor of the FinAgent system. Analyze the user's query.\n"
+        "Determine the asset symbol (target ticker, e.g., 'BTC', 'ETH', 'HPG', or 'UNKNOWN').\n"
+        "Categorize the query into one of two modes:\n"
+        "1. 'CHITCHAT': If the query is a greeting, casual talk, or not related to financial investment analysis. Set chat to true.\n"
+        "2. 'INVESTMENT': If the query requests stock/crypto analysis, price history, technical indicators, or investment opinions. Set chat to false.\n"
+        "MANDATORY JSON OUTPUT FORMAT: {\"target\": \"SYMBOL\", \"mode\": \"INVESTMENT\" or \"CHITCHAT\"}"
     )
     
-    status_context = f"Question: {user_msg}\nProgress:\n- SQL Done: {sql_done}\n- RAG Done: {rag_done}\n- Chart Done: {chart_done}"
-    response = llm.invoke(f"{system_instruction}\n\nContext:\n{status_context}")
+    response = llm.invoke(f"{system_instruction}\n\nUser Question: {user_msg}")
     
     try:
         parsed = json.loads(response)
+        mode = parsed.get("mode", "CHITCHAT")
         return {
             "current_target": parsed.get("target", "UNKNOWN"),
-            "next_worker": parsed.get("assign_to", "FINISH")
+            "chat": True if mode == "CHITCHAT" else False,
+            "next_worker": "FINAL_ANALYST" if mode == "CHITCHAT" else "PARALLEL_EXECUTE"
         }
     except:
-        return {"current_target": "UNKNOWN", "next_worker": "FINISH"}
+        return {"current_target": "UNKNOWN", "chat": True, "next_worker": "FINAL_ANALYST"}
 
 def node_sql_worker(state: AgentState):
+    """SQL Agent chuyên trách: Lấy dữ liệu định lượng từ PostgreSQL Gold Layer"""
     user_msg = state["messages"][0].content
     ticker = state["current_target"]
     retries = state.get("retry_count", 0)
     error = state.get("error_log", "")
     
-    schema_info = "Table: prices | Columns: timestamp (DATETIME), symbol (VARCHAR), price (REAL), volume (REAL), SMA_5(REAL), SMA_20(REAL), RSI(REAL), MACD(REAL), MACD_Signal(REAL)"
+    schema_info = "Table: prices | Columns: timestamp (TIMESTAMP), symbol (VARCHAR), price (DOUBLE PRECISION), volume (DOUBLE PRECISION), SMA_5, SMA_20, RSI, MACD, MACD_Signal"
 
     system_prompt = (
-        "Based on the following schema, please generate an accurate SQLite query:\n"
+        "Based on the following PostgreSQL schema, please generate a high-performance SQL query:\n"
         f"Schema: {schema_info}\n"
         "You MUST return a JSON object with the following structure: {'sql': 'YOUR_SQL_QUERY'}\n"
-        "Ensure your query is valid, efficient, and directly answers the user's request.\n"
-        "Only return the JSON object, without any additional text or explanation.\n"
+        "Ensure your query directly filters the target asset's symbol, limits rows appropriately (max 30), and is valid syntax.\n"
+        "Only return the JSON object, without any markdown code block wrap, text or explanation.\n"
     )
 
     if error:
@@ -107,29 +112,27 @@ def node_sql_worker(state: AgentState):
         
     response = llm.invoke(f"{system_prompt}\n\nUser Question: {user_msg}")
     
-    sql_query = json.loads(response).get("sql", f"SELECT * FROM prices WHERE symbol='{ticker}' LIMIT 5;")
-    
+    try:
+        sql_query = json.loads(response).get("sql", f"SELECT * FROM prices WHERE symbol='{ticker}' ORDER BY timestamp DESC LIMIT 5;")
+    except:
+        sql_query = f"SELECT * FROM prices WHERE symbol='{ticker}' ORDER BY timestamp DESC LIMIT 5;"
+        
+    # Gọi hàm thực thi đã nâng cấp lên PostgreSQL ở giai đoạn 1
     clean_data, error_msg = tool_run_sqlite_query(sql_query)
     
-    if error_msg != "":
-        if retries + 1 < 2:
-            return {"error_log": error_msg, "retry_count": retries + 1, "next_worker": "SQL_Agent"}
+    if error_msg:
+        if retries + 1 < 2: # Self-correction Loop tối đa 2 lần
+            return {"error_log": error_msg, "retry_count": retries + 1, "next_worker": "SQL_RETRY"}
         else:
-            return {"error_log": f"SQL system crashed: {error_msg}", "sql_data_output": [], "next_worker": "SUPERVISOR"}
+            return {"error_log": f"PostgreSQL processing failure: {error_msg}", "sql_data_output": [], "next_worker": "JOIN_BARRIER"}
     
-    return {"sql_data_output": clean_data, "error_log": "", "retry_count": 0, "next_worker": "SUPERVISOR"}
-
-
-def node_chart_worker(state: AgentState):
-    ticker = state["current_target"]
-    chart = tool_generate_market_chart(ticker)
-    
-    return {"messages": [ToolMessage(content=chart, name="chart_generator", tool_call_id="chart_generator_call")]}
+    return {"sql_data_output": clean_data, "error_log": "", "retry_count": 0, "next_worker": "JOIN_BARRIER"}
 
 def node_rag_worker(state: AgentState):
+    """RAG Agent chuyên trách: Khai phá văn bản vĩ mô từ Qdrant Vector DB"""
     user_msg = state["messages"][0].content
-    sql_context = state.get("sql_data_output", [])
     
+    # Kỹ thuật nâng cao: Giữ nguyên cơ chế kiểm tra và viết lại truy vấn (Query Rewriting) để tối ưu hóa vector search
     check_prompt = """
         Determine if the following user query contains excessive conversational filler or "noise" that obscures the core financial intent.
         Return a JSON object with a single boolean key 'need_rewrite' (true if noisy, false if concise and clear).
@@ -148,7 +151,6 @@ def node_rag_worker(state: AgentState):
     except:
         need_rewrite = False
         
-        
     if need_rewrite:
         system_prompt = (
             "You are a Senior Context Engineering Expert. "
@@ -158,54 +160,79 @@ def node_rag_worker(state: AgentState):
             "Completely eliminate any redundant greetings or exclamations from the user. "
             "The output must be concise, professional, and focused on the economic essence."
         )
-        payload = f"User: {user_msg}\nSQL Data: {json.dumps(sql_context[:3])}"
-        query_to_search = llm.invoke(f"{system_prompt}\n\nPayload:\n{payload}")
+        query_to_search = llm.invoke(f"{system_prompt}\n\nUser Message: {user_msg}")
     else:
         query_to_search = user_msg
     
     rag_context = tool_semantic_rag_search(query_to_search)
-    return {"rag_text_output": rag_context, "next_worker": "SUPERVISOR"}
+    return {"rag_text_output": rag_context, "next_worker": "JOIN_BARRIER"}
+
+def node_join_barrier(state: AgentState):
+    """Barrier Node (Join): Đồng bộ hóa luồng dữ liệu song song trước khi phân tách nhánh đồ thị tiếp theo"""
+    user_msg = state["messages"][0].content.lower()
+    
+    # Kiểm tra xem user có tường minh muốn vẽ/xem biểu đồ không
+    chart_keywords = ["biểu đồ", "đồ thị", "vẽ", "chart", "graph", "visualize", "draw"]
+    needs_chart = any(kw in user_msg for kw in chart_keywords)
+    
+    if needs_chart:
+        return {"next_worker": "Chart_Agent"}
+    else:
+        return {"next_worker": "FINAL_ANALYST"}
+
+def node_chart_worker(state: AgentState):
+    """Chart Agent chuyên trách: Kết xuất đồ thị từ tập số liệu thu thập được"""
+    ticker = state["current_target"]
+    chart_result = tool_generate_market_chart(ticker)
+    
+    # SỬA LỖI LOGIC: Cập nhật biến trạng thái rõ ràng thay vì chỉ trả về ToolMessage
+    return {
+        "chart_status_msg": f"Success. {chart_result}", 
+        "next_worker": "FINAL_ANALYST",
+        "messages": [ToolMessage(content=chart_result, name="chart_generator", tool_call_id="chart_generator_call")]
+    }
 
 def node_final_analyst(state: AgentState):
+    """Analyst Agent: Tổng hợp toàn bộ dữ liệu (SQL + RAG + Chart) đưa ra quyết định đầu tư cuối cùng"""
     llm_analyst = OllamaLLM(model="qwen3.5:4b-q4_K_M", temperature=0.3)
     
     conversation_history = state["messages"]
     user_msg = conversation_history[-1].content
         
     if state["chat"]:
-        system_prompt = (
-            "You are a friendly finacial assistant aka FinAgent. respond politely and naturally in Vietnamese!"
-        )
-        prompt_payload = ("=== USER QUESTION ===\n" 
-                         f"{user_msg}"
-        )
+        system_prompt = "You are a friendly financial assistant named FinAgent. Respond politely and naturally in Vietnamese."
+        prompt_payload = f"=== USER QUESTION ===\n{user_msg}"
     else:
         target = state["current_target"]
         sql_numbers = state.get("sql_data_output", [])
-        rag_news = state.get("rag_text_output", "No related news found.")
+        rag_news = state.get("rag_text_output", "No related macro news found.")
+        chart_info = state.get("chart_status_msg", "No chart generated.")
 
         prompt_payload = (
-            "TARGET ASSET PROFILE: \n"
+            "TARGET ASSET PROFILE:\n"
             f"Target: {target}\n"
-            "=== HISTORICAL DATA ===\n"
+            "=== QUANTITATIVE HISTORICAL DATA (PostgreSQL) ===\n"
             f"{json.dumps(sql_numbers, indent=2) if sql_numbers else 'No time-series data available.'}\n\n"
-            "=== NEWS CONTEXT ===\n"
+            "=== QUALITATIVE NEWS CONTEXT (Qdrant RAG) ===\n"
             f"{rag_news}\n\n"
+            "=== VISUALIZATION STATUS ===\n"
+            f"{chart_info}\n\n"
             "=== CHAT HISTORY ===\n"
             f"{conversation_history}"
-    )
+        )
 
         system_prompt = (
-        "You are a Senior Financial Investment Analyst.\n"
-        "Below is all historical price data (if any) and macro news context retrieved from the database.\n"
-        "Please synthesize and provide a final opinion: Should I invest or wait for another time? "
-        "Respond professionally, scientifically, and strictly in Vietnamese."
-    )
+            "You are a Senior Financial Investment Analyst Expert.\n"
+            "Synthesize the historical quantitative data, technical indicators, and qualitative news context provided.\n"
+            "Provide a highly professional, definitive opinion: Should the user invest now, liquidate, or hold? \n"
+            "Respond structurally, scientifically, and strictly in Vietnamese."
+        )
     
     final_response = llm_analyst.invoke(f"{system_prompt}\n\n{prompt_payload}")
     return {"messages": [{"role": "assistant", "content": final_response}], "next_worker": "PURGE"}
 
 def node_purge_state(state: AgentState):
+    """State Purger: Làm sạch bộ nhớ đệm trạng thái giữa các phiên hội thoại để tối ưu VRAM"""
     return {
         "security_status": "",
         "chat": False,
@@ -217,66 +244,88 @@ def node_purge_state(state: AgentState):
         "next_worker": "FINISH"
     }
 
-def supervisor_conditional_edge(state: AgentState):
-    next_step = state["next_worker"]
-    if next_step == "SQL_Agent": return "call_sql"
-    elif next_step == "RAG_Agent": return "call_rag"
-    elif next_step == "Chart_Agent": return "call_chart"
-    else: return "call_analyst"
-
+# =====================================================================
+# THIẾT LẬP ĐỒ THỊ LANGGRAPH ĐA TÁC TỬ SONG SONG (PARALLEL MULTI-AGENT WORKFLOW)
+# =====================================================================
 workflow = StateGraph(AgentState)
 
+# Khai báo tất cả các Agent Node
 workflow.add_node("security_shield", node_security_shield)
 workflow.add_node("driver", node_driver)
 workflow.add_node("sql_worker", node_sql_worker)
-workflow.add_node("chart_worker", node_chart_worker)
 workflow.add_node("rag_worker", node_rag_worker)
+workflow.add_node("join_barrier", node_join_barrier)
+workflow.add_node("chart_worker", node_chart_worker)
 workflow.add_node("final_analyst", node_final_analyst)
 workflow.add_node("state_purger", node_purge_state)
 
 workflow.set_entry_point("security_shield")
 
-
-# Gateway Security Router
+# Router 1: Gateway Security Check
 workflow.add_conditional_edges(
     "security_shield",
     lambda state: "blocked" if state["next_worker"] == "FINISH" else "pass",
     {"blocked": "final_analyst", "pass": "driver"}
 )
 
-workflow.add_conditional_edges(
-    "driver",
-    lambda state: "blocked" if state["next_worker"] == "FINISH" else "pass",
-    {"blocked": "final_analyst", "pass": "supervisor"}
-)
+# Router 2: Supervisor Forking Router (Nhánh rẽ thông minh)
+def supervisor_fork_router(state: AgentState):
+    next_step = state["next_worker"]
+    if next_step == "PARALLEL_EXECUTE":
+        # Trả về mảng danh sách các node để kích hoạt cơ chế Parallel Fan-out song song thực sự
+        return ["call_sql", "call_rag"] 
+    else:
+        return ["call_analyst_direct"]
 
-# Main Supervisor Router
 workflow.add_conditional_edges(
     "driver",
-    supervisor_conditional_edge,
+    supervisor_fork_router,
     {
         "call_sql": "sql_worker",
         "call_rag": "rag_worker",
+        "call_analyst_direct": "final_analyst"
+    }
+)
+
+# Luồng tự sửa lỗi (Self-Correction Loop) riêng của SQL Worker
+workflow.add_conditional_edges(
+    "sql_worker",
+    lambda state: "self_correction" if state["next_worker"] == "SQL_RETRY" else "to_barrier",
+    {
+        "self_correction": "sql_worker",
+        "to_barrier": "join_barrier"
+    }
+)
+
+# Nhánh RAG chạy xong tự động đi về điểm tụ (Barrier Node)
+workflow.add_edge("rag_worker", "join_barrier")
+
+# Router 3: Join Barrier Node (Fan-in Check)
+workflow.add_conditional_edges(
+    "join_barrier",
+    lambda state: "call_chart" if state["next_worker"] == "Chart_Agent" else "call_analyst",
+    {
         "call_chart": "chart_worker",
         "call_analyst": "final_analyst"
     }
 )
 
-workflow.add_conditional_edges(
-    "sql_worker",
-    lambda state: "self_correction" if state["next_worker"] == "SQL_Agent" else "back_to_supervisor",
-    {
-        "self_correction": "sql_worker",
-        "back_to_supervisor": "driver"
-    }
-)
+# Điều hướng sau khi vẽ biểu đồ xong xuôi
+workflow.add_edge("chart_worker", "final_analyst")
 
-workflow.add_edge("rag_worker", "driver")
-workflow.add_edge("chart_worker", "driver")
+# Kết thúc vòng đời xử lý
 workflow.add_edge("final_analyst", "state_purger")
-
 workflow.add_edge("state_purger", END)
 
-memory = MemorySaver()
+# Tích hợp cơ chế In-Memory Checkpointer phục vụ lưu trữ quản lý State Thread
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-app = workflow.compile(checkpointer=memory)
+# 1. Khởi tạo một client Redis đồng bộ bền bỉ
+redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT)
+
+# 2. Đóng gói client vào lớp Saver của LangGraph
+redis_checkpointer = RedisSaver(redis_client)
+
+# 3. Compile đồ thị sử dụng bộ nhớ ngoài Redis thay vì RAM nội bộ của Python
+app = workflow.compile(checkpointer=redis_checkpointer)

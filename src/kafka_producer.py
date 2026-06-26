@@ -1,4 +1,3 @@
-# src/kafka_producers.py
 import asyncio
 import json
 import websockets

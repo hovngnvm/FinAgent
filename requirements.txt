@@ -6,3 +6,5 @@ pandas
 pytest
 flake8
 black
+sqlalchemy
+psycopg2-binary

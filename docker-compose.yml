@@ -1,6 +1,4 @@
 services:
-  # HẠ TẦNG KAFKA KRAFT MODE TIÊN TIẾN
-  services:
   kafka:
     image: apache/kafka:3.7.0  # Đã đổi sang Apache chính thức
     container_name: finagent_kafka
@@ -34,6 +32,19 @@ services:
       # Định danh Cluster cho KRaft
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: finagent_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: finuser
+      POSTGRES_PASSWORD: finpassword
+      POSTGRES_DB: finance_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_finance_data:/var/lib/postgresql/data
+
   langfuse_db:
     image: postgres:16-alpine
     container_name: finagent_langfuse_db
@@ -61,3 +72,17 @@ services:
       - NEXTAUTH_SECRET=secret_salt_string_for_auth_encryption
       - SALT=secret_salt_for_password_hashing
       - TELEMETRY_ENABLED=false # Tắt telemetry gửi về hãng để bảo mật tuyệt đối
+      
+  redis:
+      image: redis:7-alpine
+      container_name: finagent_redis
+      restart: always
+      ports:
+        - "6379:6379"
+      volumes:
+        - redis_cache_data:/data
+
+volumes:
+  postgres_finance_data:
+  langfuse_db_data:
+  redis_cache_data:

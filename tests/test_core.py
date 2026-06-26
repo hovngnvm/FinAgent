@@ -1,4 +1,3 @@
-# tests/test_core.py
 import os
 import json
 import pytest

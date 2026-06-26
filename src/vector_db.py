@@ -1,72 +1,97 @@
-from IPython.core import payload
+import os
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct
 from sentence_transformers import SentenceTransformer, CrossEncoder
-import os, uuid
+
+# Khởi tạo kết nối Qdrant
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+qdrant_client = QdrantClient(host=QDRANT_HOST, port=6333)
 
 COLLECTION_NAME = "financial_reports"
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-qdrant_client = QdrantClient(path=os.path.join(BASE_DIR, "data", "qdrant_storage"))
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-reranking_model = CrossEncoder("BAAI/bge-reranker-base", max_length=512)
+# Tải các mô hình phục vụ cascade pipeline
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2") # Phục vụ Dense Vector (384 chiều)
+reranking_model = CrossEncoder("BAAI/bge-reranker-large")  # Mô hình Reranker chốt hạ precision
 
-def init_vector_database(qdrant_client, COLLECTION_NAME):
-    """Khởi tạo cấu trúc Collection trong Qdrant nếu chưa tồn tại"""
-    if not qdrant_client.collection_exists(COLLECTION_NAME):
+def init_vector_database():
+    """Khởi tạo Collection hỗ trợ Hybrid Search (Dense + Sparse/BM25) trực tiếp trên Qdrant"""
+    # Kiểm tra xem collection đã tồn tại chưa để tránh ghi đè cấu hình
+    collections = qdrant_client.get_collections().collections
+    exists = any(c.name == COLLECTION_NAME for c in collections)
+    
+    if not exists:
         qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
-            # MiniLM trả về vector 384 dims, dùng khoảng cách Cosine để tìm kiếm độ tương đồng
-            vectors_config=VectorParams(size=384, distance=Distance.COSINE) 
+            # 1. Cấu hình cho Vector ngữ nghĩa (Dense)
+            vectors_config=VectorParams(
+                size=384, 
+                distance=Distance.COSINE
+            ),
+            # 2. BẬT TÍNH NĂNG MỚI: Cấu hình cho Vector từ khóa chính xác (Sparse / BM25)
+            sparse_vectors_config={
+                "text-sparse": SparseVectorParams(
+                    index=SparseIndexParams(
+                        on_disk=True # Tối ưu RAM, ghi chỉ mục xuống đĩa HNSW giống tư duy DE cứng
+                    )
+                )
+            }
         )
-        print(f"Đã tạo thành công Collection: {COLLECTION_NAME}")
+        print(f"-> [Qdrant Enterprise]: Đã khởi tạo thành công Collection Hybrid Search: {COLLECTION_NAME}")
     else:
-        print(f"Collection {COLLECTION_NAME} đã tồn tại.")
+        print(f"-> [Qdrant Enterprise]: Collection '{COLLECTION_NAME}' đã tồn tại.")
 
-# def scan_and_chunks(base_dir):
-#     """Quét thư mục market_reports và cắt nhỏ văn bản thành các chunks"""
-#     report_dir = os.path.join(base_dir, "data", "market_reports")
-#     all_chunks = []
-    
-#     if not os.path.exists(report_dir):
-#         print(f"Thư mục {report_dir} không tồn tại.")
-#         return all_chunks
+def _text_to_sparse_vector(text_content: str) -> dict:
+    """
+    Hàm băm từ khóa thô thành Sparse Vector định dạng Qdrant (Term Frequency).
+    Qdrant v1.x hỗ trợ nhận diện trực tiếp hoặc thông qua ánh xạ ID Token.
+    """
+    words = text_content.lower().split()
+    frequency = {}
+    for word in words:
+        # Loại bỏ ký tự đặc biệt cơ bản quanh từ
+        clean_word = "".join(ch for ch in word if ch.isalnum())
+        if clean_word:
+            frequency[clean_word] = frequency.get(clean_word, 0.0) + 1.0
+            
+    # Chuyển đổi sang định dạng vị trí (indices) và giá trị trọng số (values)
+    # Dùng hàm băm hash() để map chuỗi text thành ID số nguyên (indices) cho Sparse Vector
+    indices = []
+    values = []
+    for word, count in frequency.items():
+        # Đảm bảo index là số nguyên dương trong dải của Qdrant
+        indices.append(abs(hash(word)) % 1000000) 
+        values.append(float(count))
+        
+    return {"indices": indices, "values": values}
 
-#     for file_name in os.listdir(report_dir):
-#         if file_name.endswith(".txt") or file_name.endswith(".md"):
-#             with open(os.path.join(report_dir, file_name), "r", encoding="utf-8") as f:
-#                 text_content = f.read()
-                
-#                 # Thực hiện Chunking (Cắt mỗi 500 ký tự, gối đầu 50 ký tự)
-#                 chunks = [text_content[i:i+500] for i in range(0, len(text_content), 450)]
-                
-#                 for chunk in chunks:
-#                     all_chunks.append({
-#                         "text": chunk,
-#                         "source": file_name
-#                     })
-#     return all_chunks
-
-def ingest_data_to_qdrant(qdrant_client, embedding_model, COLLECTION_NAME, chunks_data):
-    """Nhận vào danh sách dữ liệu thô, tạo embedding và đẩy vào Qdrant"""
+def ingest_data_to_qdrant(chunks_data: list[dict]):
+    """Nạp dữ liệu hỗ trợ cấu trúc Parent-Child cấp cao vào Qdrant"""
     if not chunks_data:
         return
-
+        
     points = []
-    # Sử dụng hàm generate_id() của qdrant hoặc dùng uuid/đếm số để làm ID cho Point
-    for item in chunks_data:
-        # Tạo vector embedding từ mô hình
-        vector = embedding_model.encode(item["text"]).tolist()
+    for idx, chunk in enumerate(chunks_data):
+        text_block = chunk["text"] # Child text phục vụ tính toán khoảng cách vector
         
-        payload = {k: v for k, v in item.items() if k != "text"}
-        payload["text"] = item["text"]
+        dense_emb = embedding_model.encode(text_block).tolist()
+        sparse_emb = _text_to_sparse_vector(text_block)
         
-        point_id = item.get("id", str(uuid.uuid4()))
-        points.append(PointStruct(
-            id=point_id,
-            vector=vector,
-            payload=payload
-        ))
+        points.append(
+            PointStruct(
+                id=abs(hash(chunk["source"] + chunk["chunk_hierarchy"] + str(idx))) % 10000000,
+                vector={
+                    "": dense_emb,
+                    "text-sparse": sparse_emb
+                },
+                payload={
+                    "text": text_block,
+                    "parent_text": chunk.get("parent_text", text_block), # LƯU TRỮ TRỰC TIẾP PARENT TEXT VÀO PAYLOAD
+                    "source": chunk["source"],
+                    "timestamp": chunk.get("timestamp", ""),
+                    "hierarchy": chunk["chunk_hierarchy"]
+                }
+            )
+        )
         
-    if points:
-        qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
+    qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
+    print(f"-> [Qdrant Ingestion]: Đã nạp thành công {len(points)} Parent-Child chunks.")
